@@ -58,7 +58,7 @@ class VkUserPostScraper:
     def get_users_chunk(self, limit=1000):
         with self.conn.cursor() as cur:
             cur.execute(f"""
-                SELECT id FROM users_detailed 
+                SELECT id FROM users 
                 WHERE id > {self.last_processed_id}
                   AND is_closed = FALSE 
                   AND deactivated IS NULL 
