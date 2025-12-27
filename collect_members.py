@@ -9,10 +9,6 @@ from datetime import datetime
 from config import user, password, db_name, host, token
 from requests.exceptions import ReadTimeout, ConnectionError
 
-user = 'postgres'
-password = '1'
-host = 'localhost'
-db_name = 'vk_posts'
 
 # --- КОНФИГУРАЦИЯ ---
 DB_CONFIG = {

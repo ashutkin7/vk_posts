@@ -5,9 +5,8 @@ import os
 import random
 import psycopg2
 from psycopg2.extras import execute_values
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import user, password, db_name, host, token
-from requests.exceptions import ReadTimeout, ConnectionError
 
 # --- КОНФИГУРАЦИЯ ---
 DB_CONFIG = {
@@ -17,26 +16,27 @@ DB_CONFIG = {
     "host": host
 }
 
-# НАСТРОЙКИ СКОРОСТИ
-# Пытаемся взять 5 запросов по 100 постов за раз (итого 500).
-EXECUTE_BATCH = 5
+# --- НАСТРОЙКИ ---
+DAYS_TO_SCRAPE = 183  # Полгода
+MAX_POSTS_LIMIT = 50000  # Страховка
 
-# --- ИЗМЕНЕНИЕ: ЦЕЛЬ ВСЕГО 500 ПОСТОВ С ГРУППЫ ---
-TARGET_POSTS_COUNT = 500
+EXECUTE_BATCH = 5  # 5 запросов по 100 = 500 постов за раз
+BATCH_SIZE = 500  # Размер буфера записи в БД
+VK_SLEEP = 0.4  # Пауза
 
-BATCH_SIZE = 500
-VK_SLEEP = 1.0
-ERROR_SLEEP = 600
 STATE_FILE = "posts_parser_state.json"
 DEBUG = True
 
 
 class VkPostScraper:
     def __init__(self, token):
-        self.api = vk.API(access_token=token, v='5.131', timeout=120)
+        self.api = vk.API(access_token=token, v='5.131', timeout=60)
         self.conn = psycopg2.connect(**DB_CONFIG)
         self.posts_buffer = []
         self.state = self.load_state()
+
+        self.cutoff_date = datetime.now() - timedelta(days=DAYS_TO_SCRAPE)
+        print(f"📅 Дата отсечения: {self.cutoff_date.strftime('%Y-%m-%d')}")
 
     def log(self, message):
         if DEBUG:
@@ -55,15 +55,13 @@ class VkPostScraper:
         with open(STATE_FILE, "w") as f:
             json.dump({"group_id": group_id, "offset": offset}, f)
 
-    def get_groups_to_scrape(self):
+    def get_groups_from_db(self):
         with self.conn.cursor() as cur:
             cur.execute("""
                 SELECT id, name FROM groups 
                 WHERE is_active = TRUE 
                   AND deactivated IS NULL
-                  AND is_closed = 0
-                  AND wall != 0
-                ORDER BY members_count DESC
+                ORDER BY id ASC
             """)
             return cur.fetchall()
 
@@ -71,68 +69,81 @@ class VkPostScraper:
         if not self.posts_buffer:
             return
 
-        # Удаление дубликатов перед записью
-        unique_posts_dict = {post[0]: post for post in self.posts_buffer}
-        unique_posts_list = list(unique_posts_dict.values())
+        unique_map = {}
+        for p in self.posts_buffer:
+            unique_map[(p[1], p[0])] = p
+
+        unique_posts_list = list(unique_map.values())
 
         try:
             with self.conn.cursor() as cur:
                 query = """
-                    INSERT INTO group_posts (
-                        id, group_id, text, published_at, post_type,
+                    INSERT INTO posts (
+                        id, owner_id, owner_type, from_id, text, date, post_type,
+                        is_pinned, marked_as_ads,
                         likes_count, views_count, reposts_count, comments_count,
-                        has_photo, has_video, attachments
+                        is_copy, copy_owner_id, copy_post_id, copy_text,
+                        has_photo, has_video, has_audio, has_link, 
+                        attachments, scraped_at
                     ) VALUES %s
-                    ON CONFLICT (id) DO UPDATE SET
+                    ON CONFLICT (owner_id, id) DO UPDATE SET
                         text = EXCLUDED.text,
+                        post_type = EXCLUDED.post_type,
+                        is_pinned = EXCLUDED.is_pinned,
+                        marked_as_ads = EXCLUDED.marked_as_ads,
                         likes_count = EXCLUDED.likes_count,
                         views_count = EXCLUDED.views_count,
                         reposts_count = EXCLUDED.reposts_count,
                         comments_count = EXCLUDED.comments_count,
-                        attachments = EXCLUDED.attachments;
+                        is_copy = EXCLUDED.is_copy,
+                        copy_owner_id = EXCLUDED.copy_owner_id,
+                        copy_post_id = EXCLUDED.copy_post_id,
+                        copy_text = EXCLUDED.copy_text,
+                        has_photo = EXCLUDED.has_photo,
+                        has_video = EXCLUDED.has_video,
+                        has_audio = EXCLUDED.has_audio,
+                        has_link = EXCLUDED.has_link,
+                        attachments = EXCLUDED.attachments,
+                        scraped_at = EXCLUDED.scraped_at;
                 """
                 execute_values(cur, query, unique_posts_list)
                 self.conn.commit()
                 self.posts_buffer.clear()
         except Exception as e:
-            self.log(f"❌ Ошибка БД: {e}")
+            self.log(f"❌ Ошибка записи в БД: {e}")
             self.conn.rollback()
             self.posts_buffer.clear()
 
-    def sleep_long(self, reason):
-        self.log(f"🛑 {reason}")
-        self.log(f"💤 Спим {int(ERROR_SLEEP / 60)} минут...")
-        time.sleep(ERROR_SLEEP)
-        self.log("🔔 Просыпаемся.")
-
     def parse_posts_from_group(self, group_id, group_name, start_offset=0):
-        print(f"\n🚀 Группа: {group_name} (ID: {group_id}) | Цель: {TARGET_POSTS_COUNT} постов")
-        if start_offset > 0:
-            print(f"⏩ Продолжаем с позиции: {start_offset}")
+        print(f"\n🚀 Группа: {group_name} (ID: {group_id})")
 
+        owner_id = -group_id
         offset = start_offset
+        stop_scraping = False
+        saved_count_local = 0
         current_execute_batch = EXECUTE_BATCH
 
-        while offset < TARGET_POSTS_COUNT:
-            # Вычисляем сколько осталось
-            remaining = TARGET_POSTS_COUNT - offset
-            needed_calls = (remaining + 99) // 100
-            actual_batch = min(current_execute_batch, needed_calls)
+        # Переменная для хранения реального кол-ва постов в группе
+        real_total_count = None
 
-            # Стандартный VKSCRIPT без лишних наворотов
+        while not stop_scraping and offset < MAX_POSTS_LIMIT:
+
+            # Если мы уже знаем точное кол-во постов в группе и прошли его - СТОП.
+            if real_total_count is not None and offset >= real_total_count:
+                print(f"\r   🏁 Достигнут конец ленты ({offset} >= {real_total_count}).")
+                break
+
+            # VKScript теперь возвращает объект {items: [], count: 123}
             code = f"""
-                var group_id = -{group_id}; 
+                var group_id = {owner_id}; 
                 var start_offset = {offset};
                 var posts = [];
                 var i = 0;
-                var batch_size = {actual_batch};
-
-                var result_status = "ok";
-                var error_msg = "";
+                var batch_size = {current_execute_batch};
+                var total_count = 0;
 
                 while (i < batch_size) {{
                     var current_offset = start_offset + (i * 100);
-
                     var resp = API.wall.get({{
                         "owner_id": group_id, 
                         "count": 100, 
@@ -140,167 +151,150 @@ class VkPostScraper:
                         "extended": 0
                     }});
 
-                    if (!resp) {{
-                        result_status = "fail";
-                        error_msg = "API returned null";
-                        i = 999; 
-                    }} else {{
-                        if (!resp.items) {{
-                            result_status = "fail";
-                            error_msg = "Response has no items";
-                            i = 999;
-                        }} else {{
-                            posts = posts + resp.items;
-                            if (resp.items.length == 0) {{
-                                i = 999; 
-                            }}
-                        }}
+                    if (resp) {{
+                        posts = posts + resp.items;
+                        total_count = resp.count;
                     }}
                     i = i + 1;
                 }}
-
                 return {{
                     "items": posts,
-                    "status": result_status,
-                    "error_msg": error_msg
+                    "total_count": total_count
                 }};
             """
 
             try:
-                response = self.api.execute(code=code, timeout=120)
+                response_data = self.api.execute(code=code)
 
-                if not isinstance(response, dict):
-                    self.sleep_long("Ответ не словарь.")
-                    continue
-
-                posts = response.get('items', [])
-                status = response.get('status', 'ok')
-
-                # Если успешно получили посты
-                if posts:
-                    # Если работали на пониженной скорости, пробуем аккуратно поднять
-                    if current_execute_batch < EXECUTE_BATCH:
-                        current_execute_batch += 1
-
-                    for p in posts:
-                        if not isinstance(p, dict): continue
-
-                        has_photo = False
-                        has_video = False
-                        attachments = p.get('attachments', [])
-
-                        try:
-                            for att in attachments:
-                                at_type = att.get('type')
-                                if at_type == 'photo':
-                                    has_photo = True
-                                elif at_type == 'video':
-                                    has_video = True
-                        except:
-                            pass
-
-                        try:
-                            atts_json = json.dumps(attachments, ensure_ascii=False)
-                        except:
-                            atts_json = '[]'
-
-                        pub_date = datetime.fromtimestamp(p.get('date', 0))
-
-                        post_tuple = (
-                            p.get('id'), group_id, p.get('text', ''), pub_date,
-                            p.get('post_type', 'post'),
-                            p.get('likes', {}).get('count', 0),
-                            p.get('views', {}).get('count', 0),
-                            p.get('reposts', {}).get('count', 0),
-                            p.get('comments', {}).get('count', 0),
-                            has_photo, has_video, atts_json
-                        )
-                        self.posts_buffer.append(post_tuple)
-
-                    items_received = len(posts)
-                    offset += items_received
-
-                    print(f"\r   📝 Постов: {offset} / {TARGET_POSTS_COUNT} (Batch: {actual_batch})", end="")
-
-                    if len(self.posts_buffer) >= BATCH_SIZE:
-                        self.flush_buffer()
-                        self.save_state(group_id, offset)
-
-                # Обработка сбоя внутри execute (редко, но бывает)
-                if status == 'fail':
-                    raise Exception(f"VKScript Fail: {response.get('error_msg')}")
-
-                # Конец группы
-                if not posts and status == 'ok':
-                    self.log("\n🏁 Посты закончились.")
-                    self.save_state(group_id, TARGET_POSTS_COUNT)
+                if not response_data:
                     break
 
-                time.sleep(VK_SLEEP + random.random())
+                response_items = response_data.get('items', [])
 
-            # --- ОБРАБОТКА ОШИБОК И ПОНИЖЕНИЕ СКОРОСТИ (500 -> 300 -> 100) ---
+                # Обновляем знание о реальном размере группы
+                batch_total = response_data.get('total_count', 0)
+                if batch_total > 0:
+                    real_total_count = batch_total
+
+                # Если список пуст
+                if len(response_items) == 0:
+                    break
+
+                # --- ОБРАБОТКА ДАННЫХ ---
+                last_dt = None
+
+                # Флаг: добавили ли мы хоть что-то в этом батче?
+                # Если батч полон, но мы ничего не добавили и это не из-за даты -> возможно цикл.
+                added_in_batch = 0
+
+                for p in response_items:
+                    if not isinstance(p, dict): continue
+
+                    post_ts = p.get('date', 0)
+                    post_date = datetime.fromtimestamp(post_ts)
+                    is_pinned = bool(p.get('is_pinned', 0))
+
+                    if post_date < self.cutoff_date:
+                        if is_pinned:
+                            continue  # Пропускаем старый закреп
+                        else:
+                            stop_scraping = True
+                            break
+
+                            # Обработка данных
+                    attachments = p.get('attachments', [])
+                    has_photo = any(a.get('type') == 'photo' for a in attachments)
+                    has_video = any(a.get('type') == 'video' for a in attachments)
+                    has_audio = any(a.get('type') == 'audio' for a in attachments)
+                    has_link = any(a.get('type') == 'link' for a in attachments)
+
+                    try:
+                        atts_json = json.dumps(attachments, ensure_ascii=False)
+                    except:
+                        atts_json = '[]'
+
+                    copy_history = p.get('copy_history', [])
+                    is_copy = len(copy_history) > 0
+                    copy_owner_id = copy_history[0].get('owner_id') if is_copy else None
+                    copy_post_id = copy_history[0].get('id') if is_copy else None
+                    copy_text = copy_history[0].get('text') if is_copy else None
+
+                    post_tuple = (
+                        p.get('id'), owner_id, 'group', p.get('from_id'),
+                        p.get('text', ''), post_date, p.get('post_type', 'post'),
+                        is_pinned, bool(p.get('marked_as_ads', 0)),
+                        p.get('likes', {}).get('count', 0),
+                        p.get('views', {}).get('count', 0),
+                        p.get('reposts', {}).get('count', 0),
+                        p.get('comments', {}).get('count', 0),
+                        is_copy, copy_owner_id, copy_post_id, copy_text,
+                        has_photo, has_video, has_audio, has_link,
+                        atts_json, datetime.now()
+                    )
+                    self.posts_buffer.append(post_tuple)
+                    saved_count_local += 1
+                    added_in_batch += 1
+                    last_dt = post_date
+
+                offset += len(response_items)
+
+                # Логирование с учетом общего кол-ва
+                total_str = str(real_total_count) if real_total_count else "?"
+                date_str = last_dt.strftime('%Y-%m-%d') if last_dt else "?"
+
+                print(f"\r   ⚡ Прогресс: {offset}/{total_str} | Сохранено: {saved_count_local} | Посл.дата: {date_str}",
+                      end="")
+
+                if len(self.posts_buffer) >= BATCH_SIZE or stop_scraping:
+                    self.flush_buffer()
+                    if not stop_scraping:
+                        self.save_state(group_id, offset)
+
+                # Защита от бесконечного цикла на закрепе:
+                # Если мы получили элементы, но ничего не добавили, и стоп не сработал -> возможно, мы гоняем закреп по кругу.
+                if len(response_items) > 0 and added_in_batch == 0 and not stop_scraping:
+                    # Проверяем, не ушли ли мы за пределы
+                    if real_total_count and offset > real_total_count + 100:
+                        print("\n⚠️ Обнаружен цикл на закрепленном посте. Принудительный выход.")
+                        break
+
+                time.sleep(VK_SLEEP)
+
             except Exception as e:
-                error_str = str(e)
-                # Ловим коды ошибок: 13 (Too big), 12 (Runtime), 500 (Internal Server) или VKScript Fail
-                is_overload = "500" in error_str or "Internal Server Error" in error_str or "VKScript Fail" in error_str
-
-                # Проверка на ошибку VKAPI (13 или 12)
-                if isinstance(e, vk.exceptions.VkAPIError):
-                    if e.code == 13 or e.code == 12:
-                        is_overload = True
-
-                if is_overload:
-                    self.log(f"\n⚠️ Сбой при получении {actual_batch * 100} постов.")
-
-                    # Логика понижения:
-                    if current_execute_batch > 3:
-                        current_execute_batch = 3
-                        self.log("📉 Снижаем нагрузку: пробуем 300 постов.")
-                        time.sleep(2)
-                        continue  # Пробуем снова с 300
-
-                    elif current_execute_batch > 1:
-                        current_execute_batch = 1
-                        self.log("📉 Снижаем нагрузку: пробуем 100 постов.")
-                        time.sleep(2)
-                        continue  # Пробуем снова с 100
-
-                    else:
-                        # Если даже 100 не работает
-                        self.log("❌ Даже 100 постов вызывают ошибку. Пропускаем этот блок.")
-                        offset += 100
-                        continue
-
-                elif "Read timed out" in error_str:
-                    self.log("\n🔌 Тайм-аут. Снижаем нагрузку до минимума.")
+                print(f"\n⚠️ Ошибка: {e}")
+                if current_execute_batch == 5:
+                    current_execute_batch = 3
+                    time.sleep(2)
+                    continue
+                elif current_execute_batch == 3:
                     current_execute_batch = 1
-                    time.sleep(5)
-
+                    time.sleep(2)
+                    continue
                 else:
-                    self.sleep_long(f"Критическая ошибка: {e}")
+                    offset += 100
+                    time.sleep(5)
+                    continue
+
+        self.flush_buffer()
+        print(f"\n✅ Группа {group_name} готова. Сохранено: {saved_count_local}")
+        self.save_state(None, 0)
 
     def run(self):
-        groups = self.get_groups_to_scrape()
-        print(f"Всего групп с открытой стеной: {len(groups)}")
+        groups = self.get_groups_from_db()
+        print(f"Всего групп: {len(groups)}")
 
         last_group_id = self.state.get('group_id')
         last_offset = self.state.get('offset', 0)
-        found = False
-        if last_group_id is None: found = True
+        found_start = False if last_group_id else True
 
         for g_id, g_name in groups:
-            if not found:
+            if not found_start:
                 if g_id == last_group_id:
-                    found = True
-                    if last_offset < TARGET_POSTS_COUNT:
-                        self.parse_posts_from_group(g_id, g_name, start_offset=last_offset)
-                    else:
-                        print(f"⏩ Группа {g_name} уже собрана.")
+                    found_start = True
+                    self.parse_posts_from_group(g_id, g_name, start_offset=last_offset)
                 continue
 
             self.parse_posts_from_group(g_id, g_name, start_offset=0)
-            self.flush_buffer()
-            self.save_state(g_id, TARGET_POSTS_COUNT)
 
 
 if __name__ == "__main__":
@@ -308,7 +302,7 @@ if __name__ == "__main__":
     try:
         scraper.run()
     except KeyboardInterrupt:
-        print("\n🛑 Стоп.")
+        print("\n🛑 Скрипт остановлен.")
     finally:
         if scraper.conn:
             scraper.conn.close()

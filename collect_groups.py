@@ -2,8 +2,11 @@ import vk
 import time
 import psycopg2
 from psycopg2.extras import execute_values
-from Tokens import  access_token
+from datetime import datetime
+# Импорты конфигов (убедись, что файлы существуют)
+from Tokens import access_token
 from config import user, password, db_name, host
+
 # --- КОНФИГУРАЦИЯ ---
 ACCESS_TOKEN = access_token
 DB_CONFIG = {
@@ -14,32 +17,164 @@ DB_CONFIG = {
 }
 
 # Твой список ID групп
-GROUP_IDS = [
-    170340355, 81846282, 34273295, 170221583, 84490271, 46424112, 47349822, 218245191, 134826064, 226725968, 200699986, 70148184, 227835995, 191819870, 83521634, 230623332, 49700996, 70803593, 227029131, 216209548, 81442958, 115202195, 232513690, 172787871, 136333481, 184973499, 232214716, 230688957, 173052098, 145483971, 225061063, 197271768, 104763609, 62335198, 67131627, 90915056, 59715826, 61925620, 48236789, 219246838, 225186051, 163901702, 60410126, 226126094, 93864224, 12538150, 122855719, 61899062, 66332986, 76532043, 228464981, 90009947, 33698141, 220174687, 159045989, 73408869, 37067111, 89373035, 154493292, 130040191, 54731142, 108427660, 142985618, 11991443, 220252566, 233486770, 168393141, 171327929, 229425596, 45074881, 229781959, 114612681, 126994890, 225055211, 218024430, 34568699, 223912446, 121338379, 71952907, 21142038, 225851929, 127525404, 219073069, 226714161, 233523773, 226773567, 221477441, 21971526, 233044558, 218507873, 223591010, 172524137, 99482223, 223781505, 189350532, 12845709, 225086094, 226831000, 233046693, 62272176, 173230769, 227865268, 226065079, 214039244, 105884368, 231504596, 169634524, 227359458, 101493480, 20349674, 203627249, 190978808, 199910145, 144999176, 229272329, 138312461, 142568208, 78060310, 105720611, 79999780, 226960172, 33917741, 233345840, 223247159, 226503481, 126221119, 77925185, 227994437, 121516877, 93045584, 120165201, 43076442, 72078171, 223138652, 131461996, 198876021, 169827212, 24396689, 122694548, 211698594, 131003301, 91505577, 138163113, 47078322, 157512627, 154649529, 233753534, 61918157, 221471693, 50535375, 178158547, 183096280, 215481310, 116913122, 225375206, 155663336, 131496948, 10746870, 76375031, 118391806, 181324802, 158209030, 67163148, 36017175, 228197400, 175107101, 135160883, 58221641, 6761580, 104160365, 125756526, 48297078, 16589943, 158741643, 86250640, 218748065, 186524835, 23266468, 122477745, 230968504, 158729403, 65518785, 193516741, 234081478, 142476486, 100269268, 230773974, 150596829, 228879585, 13624546, 152683760, 225469693, 195634436, 230350099, 56519960, 198176029, 66213166, 54484275, 232789306, 233073982, 220089666, 230290762, 223055180, 53290319, 127688018, 68302164, 186613084, 116112735, 141213024, 200408423, 216577385, 81476977, 67980664, 116481406, 227050883, 64296329, 233434517, 222694806, 211637669, 229461414, 135386535, 171572662, 221345208, 155524537, 135755197, 133588423, 233176521, 76742095, 227945938, 137197025, 87260650, 226950646, 120362490, 115156499, 17321503, 93892129, 65338914, 154361383, 183680554, 82855467, 223977006, 91156015, 77983280, 231867959, 52110908, 226704966, 79099470, 190549583, 176211542, 109631066, 129646177, 154809962, 107210348, 230559342, 161709680, 55185008, 229039737, 40601221, 49065607, 226358927, 219231887, 167147159, 88790680, 189849241, 46225051, 210890409, 57476778, 227178159, 171034311, 138069703, 66043597, 96425686, 229123814, 22611691, 64079596, 234364654, 82142959, 134115068, 82781966, 115906329, 225726235, 25790249, 223608626, 61910836, 232388411, 194744127, 232558403, 53202758, 234583879, 96814938, 228390746, 144949088, 191737703, 223334262, 65398647, 231290750, 84539264, 114896770, 230641542, 226973580, 143456143, 228478881, 53768104, 222674857, 228143021, 130197426, 101003192, 170184635, 79898562, 137961418, 227166158, 124477391, 182349776, 21952469, 18755555, 39974883, 167174115, 119230439, 186214380, 119263219
-]
+GROUP_IDS = [81846282, 34273295, 170221583, 70148184, 227835995, 191819870, 83521634, 70803593, 81442958, 136333481, 184973499, 230688957, 225061063, 104763609, 67131627, 59715826, 48236789, 219246838, 163901702, 60410126, 12538150, 122855719, 61899062, 66332986, 76532043, 159045989, 73408869, 37067111, 89373035, 154493292, 108427660, 11991443, 220252566, 168393141, 114612681, 126994890, 71952907, 21142038, 225851929, 127525404, 219073069, 172524137, 99482223, 12845709, 131461996, 62272176, 173230769, 226065079, 101493480, 20349674, 203627249, 190978808, 144999176, 138312461, 142568208, 78060310, 105720611, 79999780, 226960172, 223247159, 126221119, 77925185, 43076442, 72078171, 169827212, 211698594, 91505577, 138163113, 157512627, 154649529, 61918157, 50535375, 178158547, 183096280, 215481310, 116913122, 155663336, 10746870, 158209030, 36017175, 228197400, 175107101, 135160883, 58221641, 158741643, 86250640, 186524835, 23266468, 122477745, 158729403, 100269268, 152683760, 225469693, 195634436, 230350099, 56519960, 198176029, 220089666, 53290319, 127688018, 68302164, 116112735, 141213024, 116481406, 64296329, 155524537, 135755197, 133588423, 87260650, 17321503, 93892129, 65338914, 154361383, 183680554, 91156015, 52110908, 226704966, 109631066, 129646177, 154809962, 40601221, 49065607, 88790680, 57476778, 227178159, 138069703, 66043597, 82142959, 82781966, 115906329, 25790249, 61910836, 194744127, 96814938, 144949088, 65398647, 84539264, 114896770, 143456143, 53768104, 101003192, 170184635, 79898562, 21952469, 167174115]
 
 
 # Инициализация API
 api = vk.API(access_token=access_token, v='5.131')
 
 
-# --- ФУНКЦИИ БД ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
 
+def split_list(lst, n):
+    """Разбивает список на куски по n элементов"""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def parse_vk_date(date_str):
+    """
+    VK отдает start_date как 'YYYYMMDD' (строка) или timestamp.
+    Postgres DATE требует 'YYYY-MM-DD'.
+    """
+    if not date_str:
+        return None
+
+    # Если это число (timestamp)
+    if isinstance(date_str, int):
+        return datetime.fromtimestamp(date_str).strftime('%Y-%m-%d')
+
+    # Если строка YYYYMMDD
+    if len(str(date_str)) == 8:
+        try:
+            d = str(date_str)
+            return f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
+        except:
+            return None
+    return None
+
+
+def get_max_cover_url(cover_obj):
+    """Достает ссылку на самое большое изображение обложки"""
+    if not cover_obj or not cover_obj.get('enabled'):
+        return None
+    images = cover_obj.get('images', [])
+    if not images:
+        return None
+    # Сортируем по ширине и берем последнее (самое большое)
+    try:
+        sorted_imgs = sorted(images, key=lambda x: x.get('width', 0))
+        return sorted_imgs[-1].get('url')
+    except:
+        return None
+
+
+def prepare_group_data(group):
+    """
+    Подготавливает один объект группы для вставки в SQL.
+    Извлекает вложенные поля, counters и т.д.
+    """
+
+    # Счетчики
+    counters = group.get('counters', {})
+
+    # Обложка
+    cover_url = get_max_cover_url(group.get('cover'))
+
+    # Дата основания
+    start_date = parse_vk_date(group.get('start_date'))
+
+    return (
+        group['id'],
+        group.get('name', '')[:255],  # Обрезаем на всякий случай
+        group.get('screen_name'),
+        group.get('type'),
+        group.get('is_closed'),
+        group.get('deactivated'),  # banned, deleted или None
+        group.get('members_count', 0),
+        group.get('description', ''),
+        group.get('status', ''),
+        group.get('site', ''),
+        bool(group.get('verified', 0)),  # Превращаем 0/1 в False/True
+        group.get('age_limits', 1),
+        group.get('city', {}).get('id'),  # Извлекаем ID
+        group.get('country', {}).get('id'),  # Извлекаем ID
+        start_date,
+        bool(group.get('market', {}).get('enabled', 0)),  # Рынок
+        counters.get('photos', 0),
+        counters.get('videos', 0),
+        counters.get('topics', 0),
+        counters.get('docs', 0),
+        cover_url,
+        group.get('photo_200') or group.get('photo_max'),  # Аватарка
+        datetime.now()  # scraped_at
+    )
+
+
+# --- ФУНКЦИИ VK ---
+def get_groups_from_vk(group_ids):
+    """
+    Получает расширенную информацию о группах для новой структуры БД.
+    """
+    all_groups = []
+
+    # Поля, которые нужно запросить
+    fields = (
+        "members_count,"
+        "description,"
+        "status,"
+        "site,"
+        "verified,"
+        "age_limits,"
+        "city,"
+        "country,"
+        "start_date,"
+        "market,"
+        "counters,"
+        "cover"
+    )
+
+    batches = split_list(group_ids, 500)
+
+    for batch in batches:
+        print(f"🔄 Запрашиваю инфо о {len(batch)} группах...")
+        try:
+            response = api.groups.getById(
+                group_ids=",".join(map(str, batch)),
+                fields=fields
+            )
+
+            # Обрабатываем каждую группу сразу
+            processed_batch = [prepare_group_data(g) for g in response]
+            all_groups.extend(processed_batch)
+
+            time.sleep(0.35)
+
+        except Exception as e:
+            print(f"⚠️ Ошибка при запросе к VK: {e}")
+
+    return all_groups
+
+
+# --- ФУНКЦИИ БД ---
 def upsert_groups(groups_data):
     """
-    Вставляет или обновляет группы в БД.
-    Заменяет функцию group_to_bd
+    Вставляет данные в таблицу groups со всеми новыми полями.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    # SQL запрос с новыми полями
     insert_query = """
     INSERT INTO groups (
         id, name, screen_name, type, is_closed, deactivated, 
-        members_count, wall, is_active
+        members_count, description, status, site, verified,
+        age_limits, city_id, country_id, start_date, market_enabled,
+        counters_photos, counters_videos, counters_topics, counters_docs,
+        cover_url, photo_max_url, scraped_at
     ) VALUES %s
     ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
@@ -48,29 +183,28 @@ def upsert_groups(groups_data):
         is_closed = EXCLUDED.is_closed,
         deactivated = EXCLUDED.deactivated,
         members_count = EXCLUDED.members_count,
-        wall = EXCLUDED.wall,
-        updated_at = NOW();
+        description = EXCLUDED.description,
+        status = EXCLUDED.status,
+        site = EXCLUDED.site,
+        verified = EXCLUDED.verified,
+        age_limits = EXCLUDED.age_limits,
+        city_id = EXCLUDED.city_id,
+        country_id = EXCLUDED.country_id,
+        start_date = EXCLUDED.start_date,
+        market_enabled = EXCLUDED.market_enabled,
+        counters_photos = EXCLUDED.counters_photos,
+        counters_videos = EXCLUDED.counters_videos,
+        counters_topics = EXCLUDED.counters_topics,
+        counters_docs = EXCLUDED.counters_docs,
+        cover_url = EXCLUDED.cover_url,
+        photo_max_url = EXCLUDED.photo_max_url,
+        scraped_at = EXCLUDED.scraped_at;
     """
 
-    # Подготовка данных для execute_values
-    values = []
-    for g in groups_data:
-        values.append((
-            g['id'],
-            g['name'],
-            g['screen_name'],
-            g.get('type'),  # group, page, event
-            g.get('is_closed'),  # 0, 1, 2
-            g.get('deactivated'),  # banned, deleted или None
-            g.get('members_count', 0),
-            g.get('wall', 0),  # тип стены
-            True  # is_active
-        ))
-
     try:
-        execute_values(cursor, insert_query, values)
+        execute_values(cursor, insert_query, groups_data)
         conn.commit()
-        print(f"✅ Успешно сохранено/обновлено групп: {len(values)}")
+        print(f"✅ Успешно сохранено/обновлено групп: {len(groups_data)}")
     except Exception as e:
         print(f"❌ Ошибка записи в БД: {e}")
         conn.rollback()
@@ -79,59 +213,32 @@ def upsert_groups(groups_data):
         conn.close()
 
 
-# --- ФУНКЦИИ VK ---
-def split_list(lst, n):
-    """Разбивает список на куски по n элементов"""
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-
-def get_groups_from_vk(group_ids):
-    """
-    Получает расширенную информацию о группах
-    """
-    all_groups = []
-
-    # VK позволяет запрашивать до 500 групп за раз
-    batches = split_list(group_ids, 500)
-
-    # Поля, которые нам нужны для новой схемы БД
-    # members_count - участники
-    # wall - тип стены (важно!)
-    # description - можно взять, но мы решили не хранить его в Groups,
-    #              но если нужно - добавь.
-    # type - тип сообщества (важно!)
-    fields_to_get = "members_count,wall,description"
-
-    for batch in batches:
-        print(f"🔄 Запрашиваю инфо о {len(batch)} группах...")
-        try:
-            # group_id передаем как строку через запятую
-            response = api.groups.getById(
-                group_ids=",".join(map(str, batch)),
-                fields=fields_to_get
-            )
-            all_groups.extend(response)
-            time.sleep(0.4)  # Не долбим API (макс 3 запроса в сек)
-
-        except Exception as e:
-            print(f"⚠️ Ошибка при запросе к VK: {e}")
-
-    return all_groups
-
-
 # --- ГЛАВНЫЙ ЗАПУСК ---
 if __name__ == "__main__":
-    if not GROUP_IDS:
+
+    # Пример получения ID из БД (если нужно будет в будущем):
+    def get_ids_from_db():
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM groups") # или другая логика
+        ids = [row[0] for row in cur.fetchall()]
+        conn.close()
+        return ids
+
+    target_ids = get_ids_from_db()
+
+    print(target_ids)
+
+    if not target_ids:
         print("Список ID пуст.")
     else:
-        print(f"🚀 Начинаю обработку {len(GROUP_IDS)} групп.")
+        print(f"🚀 Начинаю обработку {len(target_ids)} групп.")
 
-        # 1. Получаем данные из ВК
-        vk_data = get_groups_from_vk(GROUP_IDS)
+        # 1. Получаем и обрабатываем данные
+        processed_data = get_groups_from_vk(target_ids)
 
         # 2. Сохраняем в БД
-        if vk_data:
-            upsert_groups(vk_data)
+        if processed_data:
+            upsert_groups(processed_data)
         else:
             print("Данные не получены.")
