@@ -8,18 +8,11 @@ from psycopg2.extras import execute_values
 from datetime import datetime
 from config import user, password, db_name, host, token
 from requests.exceptions import ReadTimeout, ConnectionError
+from bd_connect import get_connection
 
 
-# --- КОНФИГУРАЦИЯ ---
-DB_CONFIG = {
-    "dbname": db_name,
-    "user": user,
-    "password": password,
-    "host": host
-}
-
-BATCH_SIZE = 5000
-VK_SLEEP = 1.0
+BATCH_SIZE = 10000
+VK_SLEEP = 3.5
 ERROR_SLEEP = 600  # 10 минут сна при ошибках
 STATE_FILE = "parser_state.json"
 DEBUG = True
@@ -29,7 +22,7 @@ class VkScraper:
     def __init__(self, token):
         # Увеличиваем timeout до 120 секунд, так как 10 запросов внутри execute могут выполняться долго
         self.api = vk.API(access_token=token, v='5.131', timeout=120)
-        self.conn = psycopg2.connect(**DB_CONFIG)
+        self.conn = get_connection()
         self.users_buffer = []
         self.subs_buffer = []
         self.total_saved = 0
@@ -56,8 +49,7 @@ class VkScraper:
         with self.conn.cursor() as cur:
             cur.execute("""
                 SELECT id, name, members_count FROM groups 
-                WHERE is_active = TRUE 
-                  AND deactivated IS NULL
+                WHERE deactivated IS NULL
                 ORDER BY members_count DESC
             """)
             return cur.fetchall()
@@ -115,156 +107,162 @@ class VkScraper:
 
         offset = start_offset
 
-        # --- МАКСИМАЛЬНОЕ УСКОРЕНИЕ ---
-        # 10 запросов * 1000 юзеров = 10 000 за один HTTP запрос
-        EXECUTE_BATCH = 10
+        # Начинаем с небольшого батча для тяжелых запросов
+        current_execute_batch = 10
+        use_direct_api = False  # Флаг безопасного режима
 
-        while True:
-            code = f"""
-                var group_id = {group_id};
-                var start_offset = {offset};
-                var members = [];
-                var i = 0;
-                var batch_size = {EXECUTE_BATCH};
+        while offset < members_count:
+            members = []
 
-                // Статус результата: 'ok' или 'fail'
-                var result_status = "ok";
-                var error_msg = "";
-                var failed_index = -1;
+            if not use_direct_api:
+                # --- ПОПЫТКА ЧЕРЕЗ EXECUTE ---
+                code = f"""
+                    var group_id = {group_id};
+                    var start_offset = {offset};
+                    var members = [];
+                    var i = 0;
+                    var batch_size = {current_execute_batch};
+                    var result_status = "ok";
+                    var error_msg = "";
 
-                while (i < batch_size) {{
-                    var current_offset = start_offset + (i * 1000);
+                    while (i < batch_size) {{
+                        var current_offset = start_offset + (i * 1000);
+                        var resp = API.groups.getMembers({{
+                            "group_id": group_id, 
+                            "count": 1000, 
+                            "offset": current_offset, 
+                            "v": "5.131",
+                            "fields": "sex, bdate, city, country, has_mobile, photo_max_orig, site, status, followers_count, last_seen, domain"
+                        }});
 
-                    var resp = API.groups.getMembers({{
-                        "group_id": group_id, 
-                        "count": 1000, 
-                        "offset": current_offset, 
-                        "fields": "sex, bdate, city, country, has_mobile, photo_max_orig, site, status, followers_count, last_seen, domain"
-                    }});
-
-                    // 1. Проверка на полный провал (null)
-                    if (!resp) {{
-                        result_status = "fail";
-                        error_msg = "API returned null";
-                        failed_index = i;
-                        // Прерываем цикл
-                        i = 999; 
-                    }} else {{
-                        // 2. Проверка структуры ответа
-                        if (!resp.items) {{
-                            result_status = "fail";
-                            error_msg = "Response has no items";
-                            failed_index = i;
-                            i = 999;
+                        if (!resp || !resp.items) {{
+                            if (members.length > 0) {{ result_status = "partial"; }} 
+                            else {{ result_status = "fail"; }}
+                            error_msg = "API returned null";
+                            i = 999; 
                         }} else {{
-                            // Всё ок, добавляем
                             members = members + resp.items;
-
-                            // 3. Проверка на конец списка
-                            if (resp.items.length == 0) {{
-                                i = 999; 
-                            }}
+                            if (resp.items.length == 0) {{ i = 999; }}
                         }}
+
+                        if (i != 999) {{ i = i + 1; }}
                     }}
-                    i = i + 1;
-                }}
 
-                return {{
-                    "items": members,
-                    "status": result_status,
-                    "error_msg": error_msg,
-                    "failed_at_index": failed_index
-                }};
-            """
+                    return {{
+                        "items": members,
+                        "status": result_status,
+                        "error_msg": error_msg
+                    }};
+                """
 
-            try:
-                # self.log(f"Запрос execute (offset={offset})...")
+                try:
+                    response = self.api.execute(code=code, timeout=120)
 
-                # Timeout 120 сек, так как 10 запросов могут выполняться долго
-                response = self.api.execute(code=code, timeout=120)
-
-                # Проверка: пришел ли корректный JSON
-                if not isinstance(response, dict):
-                    self.sleep_long("Ответ от execute не является словарем (Сбой API).")
-                    continue
-
-                members = response.get('items', [])
-                status = response.get('status', 'ok')
-
-                # --- ЛОГИКА ОБРАБОТКИ РЕЗУЛЬТАТА ---
-
-                # Сохраняем то, что успели получить
-                if members:
-                    for u in members:
-                        if not isinstance(u, dict): continue
-
-                        bdate = u.get('bdate')
-                        valid_bdate = None
-                        if bdate and isinstance(bdate, str) and len(bdate.split('.')) == 3:
-                            try:
-                                valid_bdate = datetime.strptime(bdate, "%d.%m.%Y").date()
-                            except:
-                                valid_bdate = None
-
-                        city = u.get('city', {}).get('title') if isinstance(u.get('city'), dict) else None
-                        country = u.get('country', {}).get('id') if isinstance(u.get('country'), dict) else None
-
-                        last_seen_time = None
-                        platform = None
-                        if isinstance(u.get('last_seen'), dict):
-                            last_seen_time = datetime.fromtimestamp(u['last_seen'].get('time', 0))
-                            platform = u['last_seen'].get('platform')
-
-                        user_tuple = (
-                            u.get('id'), u.get('first_name'), u.get('last_name'), u.get('domain'),
-                            u.get('sex'), valid_bdate, city, country,
-                            bool(u.get('has_mobile')), bool(u.get('photo_max_orig')),
-                            u.get('site'), u.get('status'), u.get('followers_count', 0),
-                            platform, last_seen_time
-                        )
-                        self.users_buffer.append(user_tuple)
-                        self.subs_buffer.append((group_id, u.get('id'), datetime.now()))
-
-                    # Сдвигаем оффсет на реальное кол-во полученных
-                    saved_count = len(members)
-                    offset += saved_count
-
-                    print(f"\r   ⚡ Обработано: {offset} / {members_count}", end="")
-
-                    # Сброс в БД
-                    if len(self.users_buffer) >= BATCH_SIZE:
-                        self.flush_buffer()
-                        self.save_state(group_id, offset)
-
-                # Проверяем ошибки
-                if status == 'fail':
-                    error_msg = response.get('error_msg')
-                    failed_index = response.get('failed_at_index')
-                    self.log(f"\n⚠️ Сбой внутри execute на шаге {failed_index}: {error_msg}")
-                    self.sleep_long("Получена ошибка из VKScript.")
-                    continue
-
-                    # Конец группы
-                if not members and status == 'ok':
-                    if offset < members_count:
-                        self.sleep_long("Получен пустой список, но группа не кончилась.")
+                    if not isinstance(response, dict):
+                        self.log("Ответ от execute не является словарем. Перехожу на прямые запросы.")
+                        use_direct_api = True
                         continue
+
+                    status = response.get('status', 'ok')
+
+                    if status == 'fail':
+                        self.log(f"⚠️ Сбой execute на offset {offset}. Перехожу на прямые запросы.")
+                        use_direct_api = True
+                        continue
+
+                    members = response.get('items', [])
+
+                    # Если execute отработал успешно, пробуем понемногу увеличивать батч
+                    if status == 'ok' and current_execute_batch < 5:
+                        current_execute_batch += 1
+
+                except Exception as e:
+                    self.log(f"⚠️ Ошибка execute: {e}. Перехожу на прямые запросы.")
+                    use_direct_api = True
+                    continue
+
+            else:
+                # --- БЕЗОПАСНЫЙ ПРЯМОЙ ЗАПРОС ---
+                try:
+                    # self.log(f"🐌 Прямой запрос для offset {offset}...")
+                    resp = self.api.groups.getMembers(
+                        group_id=group_id,
+                        count=1000,
+                        offset=offset,
+                        fields="sex, bdate, city, country, has_mobile, photo_max_orig, site, status, followers_count, last_seen, domain"
+                    )
+
+                    if resp and 'items' in resp:
+                        members = resp['items']
+                        # Периодически пытаемся вернуться к быстрому execute
+                        if random.random() < 0.1:
+                            use_direct_api = False
+                            current_execute_batch = 1
                     else:
-                        self.log("🏁 Конец группы.")
-                        self.save_state(group_id, members_count)
+                        self.log("❌ Прямой запрос тоже вернул пустоту. Конец данных или бан.")
                         break
 
-                time.sleep(VK_SLEEP + random.random())
+                except Exception as e:
+                    self.log(f"❌ Ошибка прямого запроса: {e}")
+                    self.sleep_long("API полностью не отвечает.")
+                    continue
 
-            except (ReadTimeout, ConnectionError) as e:
-                self.sleep_long(f"Ошибка сети: {e}")
+            # --- ОБРАБОТКА И СОХРАНЕНИЕ ---
+            if members:
+                for u in members:
+                    if not isinstance(u, dict): continue
 
-            except vk.exceptions.VkAPIError as e:
-                # Глобальные ошибки API
-                self.sleep_long(f"Ошибка VK API (Код {e.code}): {e}")
+                    bdate = u.get('bdate')
+                    valid_bdate = None
+                    if bdate and isinstance(bdate, str) and len(bdate.split('.')) == 3:
+                        try:
+                            valid_bdate = datetime.strptime(bdate, "%d.%m.%Y").date()
+                        except:
+                            valid_bdate = None
 
-            except Exception as e:
-                self.sleep_long(f"Критическая ошибка скрипта: {e}")
+                    city = u.get('city', {}).get('title') if isinstance(u.get('city'), dict) else None
+                    country = u.get('country', {}).get('id') if isinstance(u.get('country'), dict) else None
+
+                    last_seen_time = None
+                    platform = None
+                    if isinstance(u.get('last_seen'), dict):
+                        last_seen_time = datetime.fromtimestamp(u['last_seen'].get('time', 0))
+                        platform = u['last_seen'].get('platform')
+
+                    user_tuple = (
+                        u.get('id'), u.get('first_name'), u.get('last_name'), u.get('domain'),
+                        u.get('sex'), valid_bdate, city, country,
+                        bool(u.get('has_mobile')), bool(u.get('photo_max_orig')),
+                        u.get('site'), u.get('status'), u.get('followers_count', 0),
+                        platform, last_seen_time
+                    )
+                    self.users_buffer.append(user_tuple)
+                    self.subs_buffer.append((group_id, u.get('id'), datetime.now()))
+
+                offset += len(members)
+                print(
+                    f"\r   ⚡ Обработано: {offset} / {members_count} (Режим: {'Прямой' if use_direct_api else 'Execute'})",
+                    end="")
+
+                if len(self.users_buffer) >= BATCH_SIZE:
+                    self.flush_buffer()
+                    self.save_state(group_id, offset)
+
+            elif not members and not use_direct_api:
+                # Если execute вернул пустой список, но статус ok
+                break
+            elif not members and use_direct_api:
+                break
+
+            time.sleep(VK_SLEEP + random.random())
+
+        # Финализация группы
+        self.flush_buffer()
+        if offset < members_count:
+            self.log(f"\n🏁 Вконтакте отдал всех доступных юзеров ({offset} из {members_count}).")
+        else:
+            self.log("\n🏁 Конец группы.")
+        self.save_state(None, 0)
 
     def run(self):
         groups = self.get_groups_to_scrape()

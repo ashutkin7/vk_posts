@@ -7,13 +7,7 @@ from psycopg2.extras import execute_values
 from datetime import datetime, timedelta
 from config import user, password, db_name, host, token
 
-# --- КОНФИГУРАЦИЯ ---
-DB_CONFIG = {
-    "dbname": db_name,
-    "user": user,
-    "password": password,
-    "host": host
-}
+from bd_connect import get_connection
 
 # --- НАСТРОЙКИ ---
 DAYS_TO_SCRAPE = 183  # Полгода
@@ -30,7 +24,7 @@ DEBUG = True
 class VkUserPostScraper:
     def __init__(self, token):
         self.api = vk.API(access_token=token, v='5.131', timeout=60)
-        self.conn = psycopg2.connect(**DB_CONFIG)
+        self.conn = get_connection()
         self.posts_buffer = []
         self.last_processed_id = self.load_state()
 

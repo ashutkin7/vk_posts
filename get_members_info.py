@@ -1,35 +1,32 @@
-import asyncio
-import asyncpg
 import csv
 import os
+import psycopg2
+from psycopg2.extras import RealDictCursor  # Для работы с именами колонок
 
-# --- ИМПОРТ КОНФИГУРАЦИИ ---
-try:
-    from config import user, password, db_name, host
-except ImportError:
-    print("❌ Ошибка: Не найден файл config.py")
-    exit(1)
-
-# Формируем строку подключения
-DB_DSN = f"postgresql://{user}:{password}@{host}/{db_name}"
+# Импортируем вашу функцию подключения
+from bd_connect import get_connection
 
 
-async def print_general_stats(pool):
+def print_general_stats(conn):
     """Выводит общую статистику по базе."""
     print("\n📊 --- ОБЩАЯ СТАТИСТИКА ---")
 
-    async with pool.acquire() as conn:
+    # Используем RealDictCursor, чтобы row['column_name'] работал
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
         # 1. Общее количество пользователей
-        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        cur.execute("SELECT COUNT(*) FROM users")
+        total_users = cur.fetchone()['count']
         print(f"👥 Всего пользователей в базе: {total_users}")
 
         # 2. Количество подписок (связей)
-        total_subs = await conn.fetchval("SELECT COUNT(*) FROM subscriptions")
+        cur.execute("SELECT COUNT(*) FROM subscriptions")
+        total_subs = cur.fetchone()['count']
         print(f"🔗 Всего связей (подписок): {total_subs}")
 
         # 3. Распределение по полу
         print("\n🚹🚺 Распределение по полу:")
-        sex_rows = await conn.fetch("SELECT sex, COUNT(*) as cnt FROM users GROUP BY sex ORDER BY cnt DESC")
+        cur.execute("SELECT sex, COUNT(*) as cnt FROM users GROUP BY sex ORDER BY cnt DESC")
+        sex_rows = cur.fetchall()
         sex_map = {1: "Женский", 2: "Мужской", 0: "Не указан"}
         for row in sex_rows:
             sex_name = sex_map.get(row['sex'], "Неизвестно")
@@ -37,7 +34,7 @@ async def print_general_stats(pool):
 
         # 4. Топ-5 Городов
         print("\n🏙️ Топ-5 городов:")
-        city_rows = await conn.fetch("""
+        cur.execute("""
             SELECT city_title, COUNT(*) as cnt 
             FROM users 
             WHERE city_title IS NOT NULL 
@@ -45,11 +42,11 @@ async def print_general_stats(pool):
             ORDER BY cnt DESC 
             LIMIT 5
         """)
-        for row in city_rows:
+        for row in cur.fetchall():
             print(f"   - {row['city_title']}: {row['cnt']}")
 
 
-async def print_last_users(pool, limit=10):
+def print_last_users(conn, limit=10):
     """Выводит информацию о последних добавленных пользователях."""
     print(f"\n🆕 --- ПОСЛЕДНИЕ {limit} ДОБАВЛЕННЫХ ПОЛЬЗОВАТЕЛЕЙ ---")
 
@@ -57,13 +54,13 @@ async def print_last_users(pool, limit=10):
         SELECT id, first_name, last_name, city_title, bdate, status 
         FROM users 
         ORDER BY last_seen DESC NULLS LAST 
-        LIMIT $1
+        LIMIT %s
     """
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(query, limit)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, (limit,))
+        rows = cur.fetchall()
 
-        # Заголовок таблицы
         print(f"{'ID':<12} | {'Имя Фамилия':<30} | {'Город':<20} | {'Дата рожд.'}")
         print("-" * 80)
 
@@ -71,54 +68,52 @@ async def print_last_users(pool, limit=10):
             full_name = f"{row['first_name']} {row['last_name']}"
             city = row['city_title'] if row['city_title'] else "Нет данных"
             bdate = str(row['bdate']) if row['bdate'] else "-"
-
             print(f"{row['id']:<12} | {full_name:<30} | {city:<20} | {bdate}")
 
 
-async def export_csv(pool):
-    """Экспортирует данные в CSV файл (опционально)."""
+def export_csv(conn):
+    """Экспортирует данные в CSV файл."""
     filename = "users_export.csv"
     print(f"\n💾 Экспорт данных в файл {filename}...")
 
-    async with pool.acquire() as conn:
-        # Получаем данные с курсором для экономии памяти
-        rows = await conn.fetch("SELECT id, first_name, last_name, city_title, has_mobile, site FROM users LIMIT 1000")
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT id, first_name, last_name, city_title, has_mobile, site FROM users LIMIT 1000")
+        rows = cur.fetchall()
 
         if not rows:
             print("Нет данных для экспорта.")
             return
 
         with open(filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            # Заголовки (берем из ключей первой записи)
-            writer.writerow(rows[0].keys())
-            # Данные
-            for row in rows:
-                writer.writerow(row.values())
+            # Используем DictWriter, так как у нас список словарей
+            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
 
     print("✅ Экспорт завершен.")
 
 
-async def main():
-    print(f"🔌 Подключение к БД {db_name}...")
-    try:
-        pool = await asyncpg.create_pool(DB_DSN)
-    except Exception as e:
-        print(f"🛑 Ошибка подключения: {e}")
+def main():
+    print("🔌 Подключение к БД...")
+    conn = get_connection()
+
+    if conn is None:
         return
 
-    # Запуск функций анализа
-    await print_general_stats(pool)
-    await print_last_users(pool, limit=10)
+    try:
+        # Запуск функций анализа
+        print_general_stats(conn)
+        print_last_users(conn, limit=10)
 
-    # Раскомментируйте строчку ниже, если хотите сохранить данные в файл
-    # await export_csv(pool)
+        # Раскомментируйте для экспорта
+        # export_csv(conn)
 
-    await pool.close()
-    print("\n🏁 Проверка завершена.")
+    except Exception as e:
+        print(f"🛑 Ошибка при выполнении запросов: {e}")
+    finally:
+        conn.close()
+        print("\n🏁 Проверка завершена. Соединение закрыто.")
 
 
 if __name__ == "__main__":
-    if os.name == 'nt':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    main()

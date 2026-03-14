@@ -7,14 +7,9 @@ import psycopg2
 from psycopg2.extras import execute_values
 from datetime import datetime, timedelta
 from config import user, password, db_name, host, token
-
+from bd_connect import get_connection
 # --- КОНФИГУРАЦИЯ ---
-DB_CONFIG = {
-    "dbname": db_name,
-    "user": user,
-    "password": password,
-    "host": host
-}
+
 
 # --- НАСТРОЙКИ ---
 DAYS_TO_SCRAPE = 183  # Полгода
@@ -22,7 +17,7 @@ MAX_POSTS_LIMIT = 50000  # Страховка
 
 EXECUTE_BATCH = 5  # 5 запросов по 100 = 500 постов за раз
 BATCH_SIZE = 500  # Размер буфера записи в БД
-VK_SLEEP = 0.4  # Пауза
+VK_SLEEP = 1  # Пауза
 
 STATE_FILE = "posts_parser_state.json"
 DEBUG = True
@@ -31,7 +26,7 @@ DEBUG = True
 class VkPostScraper:
     def __init__(self, token):
         self.api = vk.API(access_token=token, v='5.131', timeout=60)
-        self.conn = psycopg2.connect(**DB_CONFIG)
+        self.conn = get_connection()
         self.posts_buffer = []
         self.state = self.load_state()
 
@@ -57,10 +52,10 @@ class VkPostScraper:
 
     def get_groups_from_db(self):
         with self.conn.cursor() as cur:
+            # Выбираем только активные группы (у которых deactivated IS NULL)
             cur.execute("""
                 SELECT id, name FROM groups 
-                WHERE is_active = TRUE 
-                  AND deactivated IS NULL
+                WHERE deactivated IS NULL
                 ORDER BY id ASC
             """)
             return cur.fetchall()
@@ -77,6 +72,7 @@ class VkPostScraper:
 
         try:
             with self.conn.cursor() as cur:
+                # Обновленный запрос с photo_urls и video_urls
                 query = """
                     INSERT INTO posts (
                         id, owner_id, owner_type, from_id, text, date, post_type,
@@ -84,6 +80,7 @@ class VkPostScraper:
                         likes_count, views_count, reposts_count, comments_count,
                         is_copy, copy_owner_id, copy_post_id, copy_text,
                         has_photo, has_video, has_audio, has_link, 
+                        photo_urls, video_urls,
                         attachments, scraped_at
                     ) VALUES %s
                     ON CONFLICT (owner_id, id) DO UPDATE SET
@@ -103,6 +100,8 @@ class VkPostScraper:
                         has_video = EXCLUDED.has_video,
                         has_audio = EXCLUDED.has_audio,
                         has_link = EXCLUDED.has_link,
+                        photo_urls = EXCLUDED.photo_urls,
+                        video_urls = EXCLUDED.video_urls,
                         attachments = EXCLUDED.attachments,
                         scraped_at = EXCLUDED.scraped_at;
                 """
@@ -123,17 +122,13 @@ class VkPostScraper:
         saved_count_local = 0
         current_execute_batch = EXECUTE_BATCH
 
-        # Переменная для хранения реального кол-ва постов в группе
         real_total_count = None
 
         while not stop_scraping and offset < MAX_POSTS_LIMIT:
-
-            # Если мы уже знаем точное кол-во постов в группе и прошли его - СТОП.
             if real_total_count is not None and offset >= real_total_count:
                 print(f"\r   🏁 Достигнут конец ленты ({offset} >= {real_total_count}).")
                 break
 
-            # VKScript теперь возвращает объект {items: [], count: 123}
             code = f"""
                 var group_id = {owner_id}; 
                 var start_offset = {offset};
@@ -170,21 +165,15 @@ class VkPostScraper:
                     break
 
                 response_items = response_data.get('items', [])
-
-                # Обновляем знание о реальном размере группы
                 batch_total = response_data.get('total_count', 0)
+
                 if batch_total > 0:
                     real_total_count = batch_total
 
-                # Если список пуст
                 if len(response_items) == 0:
                     break
 
-                # --- ОБРАБОТКА ДАННЫХ ---
                 last_dt = None
-
-                # Флаг: добавили ли мы хоть что-то в этом батче?
-                # Если батч полон, но мы ничего не добавили и это не из-за даты -> возможно цикл.
                 added_in_batch = 0
 
                 for p in response_items:
@@ -196,17 +185,47 @@ class VkPostScraper:
 
                     if post_date < self.cutoff_date:
                         if is_pinned:
-                            continue  # Пропускаем старый закреп
+                            continue
                         else:
                             stop_scraping = True
                             break
 
-                            # Обработка данных
+                    # --- ИЗВЛЕЧЕНИЕ ПРЯМЫХ ССЫЛОК НА МЕДИА ---
                     attachments = p.get('attachments', [])
-                    has_photo = any(a.get('type') == 'photo' for a in attachments)
-                    has_video = any(a.get('type') == 'video' for a in attachments)
-                    has_audio = any(a.get('type') == 'audio' for a in attachments)
-                    has_link = any(a.get('type') == 'link' for a in attachments)
+
+                    photo_urls_list = []
+                    video_urls_list = []
+                    has_photo = False
+                    has_video = False
+                    has_audio = False
+                    has_link = False
+
+                    for att in attachments:
+                        att_type = att.get('type')
+
+                        if att_type == 'photo':
+                            has_photo = True
+                            sizes = att.get('photo', {}).get('sizes', [])
+                            if sizes:
+                                # Берем картинку максимальной ширины
+                                best_size = max(sizes, key=lambda x: x.get('width', 0))
+                                photo_urls_list.append(best_size.get('url'))
+
+                        elif att_type == 'video':
+                            has_video = True
+                            video = att.get('video', {})
+                            v_owner = video.get('owner_id')
+                            v_id = video.get('id')
+                            if v_owner and v_id:
+                                video_urls_list.append(f"https://vk.com/video{v_owner}_{v_id}")
+
+                        elif att_type == 'audio':
+                            has_audio = True
+                        elif att_type == 'link':
+                            has_link = True
+
+                    photos_str = ", ".join(photo_urls_list) if photo_urls_list else None
+                    videos_str = ", ".join(video_urls_list) if video_urls_list else None
 
                     try:
                         atts_json = json.dumps(attachments, ensure_ascii=False)
@@ -219,6 +238,7 @@ class VkPostScraper:
                     copy_post_id = copy_history[0].get('id') if is_copy else None
                     copy_text = copy_history[0].get('text') if is_copy else None
 
+                    # Формируем кортеж с новыми полями
                     post_tuple = (
                         p.get('id'), owner_id, 'group', p.get('from_id'),
                         p.get('text', ''), post_date, p.get('post_type', 'post'),
@@ -229,8 +249,10 @@ class VkPostScraper:
                         p.get('comments', {}).get('count', 0),
                         is_copy, copy_owner_id, copy_post_id, copy_text,
                         has_photo, has_video, has_audio, has_link,
+                        photos_str, videos_str,  # Новые поля
                         atts_json, datetime.now()
                     )
+
                     self.posts_buffer.append(post_tuple)
                     saved_count_local += 1
                     added_in_batch += 1
@@ -238,7 +260,6 @@ class VkPostScraper:
 
                 offset += len(response_items)
 
-                # Логирование с учетом общего кол-ва
                 total_str = str(real_total_count) if real_total_count else "?"
                 date_str = last_dt.strftime('%Y-%m-%d') if last_dt else "?"
 
@@ -250,10 +271,7 @@ class VkPostScraper:
                     if not stop_scraping:
                         self.save_state(group_id, offset)
 
-                # Защита от бесконечного цикла на закрепе:
-                # Если мы получили элементы, но ничего не добавили, и стоп не сработал -> возможно, мы гоняем закреп по кругу.
                 if len(response_items) > 0 and added_in_batch == 0 and not stop_scraping:
-                    # Проверяем, не ушли ли мы за пределы
                     if real_total_count and offset > real_total_count + 100:
                         print("\n⚠️ Обнаружен цикл на закрепленном посте. Принудительный выход.")
                         break

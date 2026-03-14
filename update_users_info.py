@@ -9,12 +9,7 @@ from config import user, password, db_name, host, token
 from requests.exceptions import ReadTimeout, ConnectionError
 
 # --- КОНФИГУРАЦИЯ ---
-DB_CONFIG = {
-    "dbname": db_name,
-    "user": user,
-    "password": password,
-    "host": host
-}
+
 
 # МАКСИМАЛЬНАЯ СКОРОСТЬ
 # VK API позволяет 25 обращений внутри execute.
@@ -22,7 +17,7 @@ DB_CONFIG = {
 # 25 запросов * 100 пользователей = 2500 пользователей за один сетевой запрос.
 USERS_PER_EXECUTE = 2500
 SUB_BATCH_SIZE = 100  # Пачка внутри VKScript
-
+from bd_connect import get_connection
 STATE_FILE = "full_info_state.json"
 DEBUG = True
 
@@ -31,7 +26,7 @@ class VkUserEnricher:
     def __init__(self, token):
         # Таймаут побольше, так как 2500 юзеров - это много данных
         self.api = vk.API(access_token=token, v='5.131', timeout=120)
-        self.conn = psycopg2.connect(**DB_CONFIG)
+        self.conn = get_connection()
         self.users_buffer = []
 
         # Загружаем состояние сразу в переменную
@@ -114,7 +109,7 @@ class VkUserEnricher:
         # self.log(f"📥 Запрос к БД: ID > {last_id}, лимит {limit}...")
         with self.conn.cursor() as cur:
             cur.execute(f"""
-                SELECT id FROM new_users 
+                SELECT id FROM users 
                 WHERE id > {last_id}
                 ORDER BY id ASC
                 LIMIT {limit}
